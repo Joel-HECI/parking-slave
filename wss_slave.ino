@@ -1,48 +1,87 @@
+#include <Arduino.h>
+
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
 
+#include "esp_camera.h"
+#include "placeholder.h"
 // ============================================================
-// DEVICE CONFIGURATION
+// CONFIGURATION
 // ============================================================
+
+const char* WIFI_SSID     = "TITAPUTIN";
+const char* WIFI_PASSWORD = "Renegade#2025";
+
+const char* SERVER_HOST = "192.168.1.23";
+const uint16_t SERVER_PORT = 8766;
+const char* SERVER_PATH = "/parking";
 
 #define DEVICE_ID "PARKING-ESP32-001"
-
-// Change this to a long random secret.
-// Every ESP32 slave should have a DIFFERENT secret.
 #define DEVICE_TOKEN "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
 
 // ============================================================
-// WIFI CONFIGURATION
+// CAMERA CONFIGURATION
 // ============================================================
 
-const char* WIFI_SSID = "TITAPUTIN";
-const char* WIFI_PASSWORD = "Renegade#2025";
+// IMPORTANT:
+// Keep this false until the camera is physically installed.
+#define CAMERA_ENABLED false
+
+// Frames per second when streaming.
+const uint32_t VIDEO_FRAME_INTERVAL_MS = 500;
 
 // ============================================================
-// RASPBERRY PI CONFIGURATION
+// IR SENSOR
 // ============================================================
 
-// Raspberry Pi IP address
-const char* SERVER_HOST = "192.168.1.23";
+#define IR_SENSOR_PIN 13
 
-// WSS server port
-const uint16_t SERVER_PORT = 8766;
-
-// WebSocket endpoint
-const char* SERVER_PATH = "/parking";
+int lastIRState = -1;
 
 // ============================================================
-// TLS CERTIFICATE
+// AI-THINKER ESP32-CAM CAMERA PINS
 // ============================================================
-//
-// Paste the CA certificate used to sign the Raspberry Pi
-// server certificate here.
-//
-// Do NOT use setInsecure() for the final system.
-//
+
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ============================================================
+// VIDEO SOURCE
+// ============================================================
+
+enum VideoSource {
+  VIDEO_PLACEHOLDER,
+  VIDEO_CAMERA
+};
+
+VideoSource videoSource = VIDEO_PLACEHOLDER;
+
+bool cameraInitialized = false;
+
+uint32_t lastVideoFrame = 0;
+uint32_t videoFrameCounter = 0;
+
+// ============================================================
+// TLS CA CERTIFICATE
+// ============================================================
 
 const char* ROOT_CA = R"EOF(
 -----BEGIN CERTIFICATE-----
@@ -79,445 +118,700 @@ lVfjQukCRNqjjDVGmFO3IM8Dt67JYzyLIaTb714=
 )EOF";
 
 // ============================================================
-// HARDWARE
-// ============================================================
-
-#define IR_SENSOR_PIN 13
-
-// ============================================================
-// TIMING
-// ============================================================
-
-#define SENSOR_SAMPLE_INTERVAL 100
-
-// Send periodic status even when sensor state hasn't changed
-#define STATUS_INTERVAL 5000
-
-// ============================================================
-// GLOBAL OBJECTS
+// WEBSOCKET
 // ============================================================
 
 WebSocketsClient webSocket;
 
-// ============================================================
-// STATE
-// ============================================================
-
-int lastSensorState = -1;
-
-unsigned long lastSensorSample = 0;
-unsigned long lastStatusMessage = 0;
+bool websocketConnected = false;
+bool authenticated = false;
 
 // ============================================================
-// GET TIME
+// PLACEHOLDER JPEG
+// ============================================================
+//
+// This is a very small JPEG placeholder.
+// The host receives it as a normal binary JPEG frame.
+//
+// The ESP32 doesn't need to know anything about how the host
+// displays it.
+//
 // ============================================================
 
-String getTimestamp()
-{
-    time_t now;
 
-    time(&now);
+// ============================================================
+// TIME
+// ============================================================
 
-    if (now < 1700000000)
-    {
-        return "unsynchronized";
+String getTimestamp() {
+
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo)) {
+    return "";
+  }
+
+  char buffer[32];
+
+  strftime(
+    buffer,
+    sizeof(buffer),
+    "%Y-%m-%dT%H:%M:%S%z",
+    &timeinfo
+  );
+
+  return String(buffer);
+}
+
+// ============================================================
+// WIFI
+// ============================================================
+
+void connectWiFi() {
+
+  Serial.println();
+  Serial.println("Connecting to WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    delay(500);
+
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected");
+
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("RSSI: ");
+  Serial.println(WiFi.RSSI());
+}
+
+// ============================================================
+// NTP
+// ============================================================
+
+void synchronizeTime() {
+
+  Serial.println("Synchronizing time...");
+
+  configTime(
+    0,
+    0,
+    "pool.ntp.org",
+    "time.nist.gov"
+  );
+
+  struct tm timeinfo;
+
+  for (int i = 0; i < 20; i++) {
+
+    if (getLocalTime(&timeinfo)) {
+
+      Serial.println("Time synchronized");
+      return;
     }
 
-    struct tm timeinfo;
+    delay(500);
+  }
 
-    gmtime_r(&now, &timeinfo);
+  Serial.println("WARNING: NTP synchronization failed");
+}
 
-    char buffer[32];
+// ============================================================
+// CAMERA INITIALIZATION
+// ============================================================
 
-    strftime(
-        buffer,
-        sizeof(buffer),
-        "%Y-%m-%dT%H:%M:%SZ",
-        &timeinfo
+bool initializeCamera() {
+
+#if !CAMERA_ENABLED
+
+  Serial.println();
+  Serial.println("Camera support compiled out.");
+  Serial.println("Using PLACEHOLDER video source.");
+
+  return false;
+
+#else
+
+  Serial.println();
+  Serial.println("Initializing AI-Thinker camera...");
+
+  camera_config_t config;
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 20000000;
+
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // Start conservatively.
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 2;
+
+  if (psramFound()) {
+
+    Serial.println("PSRAM detected");
+
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+
+  } else {
+
+    Serial.println("PSRAM not detected");
+
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+
+  if (err != ESP_OK) {
+
+    Serial.printf(
+      "Camera initialization failed: 0x%x\n",
+      err
     );
 
-    return String(buffer);
+    Serial.println(
+      "Falling back to PLACEHOLDER video."
+    );
+
+    return false;
+  }
+
+  sensor_t* sensor = esp_camera_sensor_get();
+
+  if (sensor != nullptr) {
+
+    sensor->set_framesize(
+      sensor,
+      psramFound() ? FRAMESIZE_VGA : FRAMESIZE_QVGA
+    );
+  }
+
+  Serial.println("Camera initialized successfully");
+
+  return true;
+
+#endif
 }
 
 // ============================================================
-// SEND AUTHENTICATION
+// VIDEO SOURCE STATUS
 // ============================================================
 
-void sendAuthentication()
-{
-    Serial.println("Sending authentication...");
+const char* videoSourceName() {
 
-    StaticJsonDocument<256> doc;
+  switch (videoSource) {
 
-    doc["type"] = "auth";
-    doc["device_id"] = DEVICE_ID;
-    doc["token"] = DEVICE_TOKEN;
+    case VIDEO_CAMERA:
+      return "camera";
 
-    String message;
-
-    serializeJson(doc, message);
-
-    webSocket.sendTXT(message);
-
-    Serial.print("TX AUTH: ");
-    Serial.println(message);
+    case VIDEO_PLACEHOLDER:
+    default:
+      return "placeholder";
+  }
 }
 
 // ============================================================
-// SEND SENSOR EVENT
+// SEND VIDEO STATUS
 // ============================================================
 
-void sendSensorEvent(int state)
-{
-    if (!webSocket.isConnected())
-    {
-        return;
+void sendVideoStatus() {
+
+  if (!websocketConnected || !authenticated) {
+    return;
+  }
+
+  JsonDocument doc;
+
+  doc["type"] = "video_status";
+  doc["device_id"] = DEVICE_ID;
+  doc["source"] = videoSourceName();
+  doc["camera_enabled"] = CAMERA_ENABLED;
+  doc["camera_initialized"] = cameraInitialized;
+  doc["timestamp"] = getTimestamp();
+
+  String output;
+
+  serializeJson(doc, output);
+
+  webSocket.sendTXT(output);
+}
+
+// ============================================================
+// SEND PLACEHOLDER FRAME
+// ============================================================
+
+void sendPlaceholderFrame() {
+
+  if (!websocketConnected || !authenticated) {
+    return;
+  }
+
+  // Send metadata first.
+  JsonDocument doc;
+
+  doc["type"] = "video_frame";
+  doc["device_id"] = DEVICE_ID;
+  doc["source"] = "placeholder";
+  doc["format"] = "jpeg";
+  doc["frame_id"] = videoFrameCounter++;
+  doc["timestamp"] = getTimestamp();
+
+  String metadata;
+
+  serializeJson(doc, metadata);
+
+  webSocket.sendTXT(metadata);
+
+  // Then send JPEG as binary WebSocket frame.
+  webSocket.sendBIN(
+    (uint8_t*)placeholder_jpg,
+    placeholder_jpg_len
+  );
+}
+
+// ============================================================
+// SEND CAMERA FRAME
+// ============================================================
+
+void sendCameraFrame() {
+
+#if !CAMERA_ENABLED
+
+  sendPlaceholderFrame();
+  return;
+
+#else
+
+  if (!cameraInitialized) {
+
+    sendPlaceholderFrame();
+    return;
+  }
+
+  camera_fb_t* fb = esp_camera_fb_get();
+
+  if (fb == nullptr) {
+
+    Serial.println(
+      "Camera capture failed - sending placeholder"
+    );
+
+    // Automatically recover to placeholder.
+    videoSource = VIDEO_PLACEHOLDER;
+
+    sendVideoStatus();
+    sendPlaceholderFrame();
+
+    return;
+  }
+
+  JsonDocument doc;
+
+  doc["type"] = "video_frame";
+  doc["device_id"] = DEVICE_ID;
+  doc["source"] = "camera";
+  doc["format"] = "jpeg";
+  doc["width"] = fb->width;
+  doc["height"] = fb->height;
+  doc["frame_id"] = videoFrameCounter++;
+  doc["timestamp"] = getTimestamp();
+
+  String metadata;
+
+  serializeJson(doc, metadata);
+
+  webSocket.sendTXT(metadata);
+
+  webSocket.sendBIN(
+    fb->buf,
+    fb->len
+  );
+
+  esp_camera_fb_return(fb);
+
+#endif
+}
+
+// ============================================================
+// VIDEO LOOP
+// ============================================================
+
+void videoLoop() {
+
+  if (!websocketConnected || !authenticated) {
+    return;
+  }
+
+  uint32_t now = millis();
+
+  if (now - lastVideoFrame < VIDEO_FRAME_INTERVAL_MS) {
+    return;
+  }
+
+  lastVideoFrame = now;
+
+  switch (videoSource) {
+
+    case VIDEO_CAMERA:
+      sendCameraFrame();
+      break;
+
+    case VIDEO_PLACEHOLDER:
+    default:
+      sendPlaceholderFrame();
+      break;
+  }
+}
+
+// ============================================================
+// SEND SENSOR
+// ============================================================
+
+void sendSensorEvent() {
+
+  if (!websocketConnected || !authenticated) {
+    return;
+  }
+
+  int state = digitalRead(IR_SENSOR_PIN);
+
+  JsonDocument doc;
+
+  doc["type"] = "sensor";
+  doc["device_id"] = DEVICE_ID;
+
+  JsonObject sensor = doc["sensor"].to<JsonObject>();
+
+  sensor["type"] = "ir";
+  sensor["gpio"] = IR_SENSOR_PIN;
+  sensor["value"] = state;
+
+  doc["timestamp"] = getTimestamp();
+  doc["uptime_ms"] = millis();
+
+  String output;
+
+  serializeJson(doc, output);
+
+  webSocket.sendTXT(output);
+
+  Serial.print("TX SENSOR: ");
+  Serial.println(output);
+}
+
+// ============================================================
+// SEND STATUS
+// ============================================================
+
+void sendStatus() {
+
+  if (!websocketConnected || !authenticated) {
+    return;
+  }
+
+  JsonDocument doc;
+
+  doc["type"] = "status";
+  doc["device_id"] = DEVICE_ID;
+
+  doc["uptime_ms"] = millis();
+
+  JsonObject wifi = doc["wifi"].to<JsonObject>();
+
+  wifi["rssi"] = WiFi.RSSI();
+  wifi["ip"] = WiFi.localIP().toString();
+
+  JsonObject sensor = doc["sensor"].to<JsonObject>();
+
+  sensor["ir"] = digitalRead(IR_SENSOR_PIN);
+
+  JsonObject video = doc["video"].to<JsonObject>();
+
+  video["source"] = videoSourceName();
+  video["camera_enabled"] = CAMERA_ENABLED;
+  video["camera_initialized"] = cameraInitialized;
+
+  doc["timestamp"] = getTimestamp();
+
+  String output;
+
+  serializeJson(doc, output);
+
+  webSocket.sendTXT(output);
+}
+
+// ============================================================
+// HANDLE SERVER MESSAGE
+// ============================================================
+
+void handleServerMessage(uint8_t* payload, size_t length) {
+
+  String message;
+
+  for (size_t i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.print("RX: ");
+  Serial.println(message);
+
+  JsonDocument doc;
+
+  DeserializationError error =
+    deserializeJson(doc, message);
+
+  if (error) {
+
+    Serial.println(
+      "Invalid JSON from server"
+    );
+
+    return;
+  }
+
+  const char* type =
+    doc["type"] | "";
+
+  // ----------------------------------------------------------
+  // AUTH OK
+  // ----------------------------------------------------------
+
+  if (strcmp(type, "auth_ok") == 0) {
+
+    authenticated = true;
+
+    Serial.println(
+      "SERVER AUTHENTICATION ACCEPTED"
+    );
+
+    sendVideoStatus();
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // AUTH FAILED
+  // ----------------------------------------------------------
+
+  if (strcmp(type, "auth_failed") == 0) {
+
+    authenticated = false;
+
+    Serial.println(
+      "SERVER AUTHENTICATION FAILED"
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // PING
+  // ----------------------------------------------------------
+
+  if (strcmp(type, "ping") == 0) {
+
+    JsonDocument response;
+
+    response["type"] = "pong";
+    response["device_id"] = DEVICE_ID;
+
+    String output;
+
+    serializeJson(response, output);
+
+    webSocket.sendTXT(output);
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // GET SENSOR
+  // ----------------------------------------------------------
+
+  if (strcmp(type, "get_sensor") == 0) {
+
+    sendSensorEvent();
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // VIDEO SOURCE CONTROL
+  // ----------------------------------------------------------
+  //
+  // This gives the server the ability to select:
+  //
+  //   "placeholder"
+  //   "camera"
+  //
+  // Later this can be useful for diagnostics.
+  //
+
+  if (strcmp(type, "set_video_source") == 0) {
+
+    const char* source =
+      doc["source"] | "placeholder";
+
+    if (strcmp(source, "camera") == 0) {
+
+#if CAMERA_ENABLED
+
+      if (cameraInitialized) {
+
+        videoSource = VIDEO_CAMERA;
+
+        Serial.println(
+          "Video source changed to CAMERA"
+        );
+
+      } else {
+
+        videoSource = VIDEO_PLACEHOLDER;
+
+        Serial.println(
+          "Camera unavailable - keeping PLACEHOLDER"
+        );
+      }
+
+#else
+
+      videoSource = VIDEO_PLACEHOLDER;
+
+      Serial.println(
+        "Camera disabled in firmware - keeping PLACEHOLDER"
+      );
+
+#endif
+
+    } else {
+
+      videoSource = VIDEO_PLACEHOLDER;
+
+      Serial.println(
+        "Video source changed to PLACEHOLDER"
+      );
     }
 
-    StaticJsonDocument<384> doc;
+    sendVideoStatus();
 
-    doc["type"] = "sensor";
-    doc["device_id"] = DEVICE_ID;
-
-    JsonObject sensor = doc.createNestedObject("sensor");
-
-    sensor["type"] = "ir";
-    sensor["gpio"] = IR_SENSOR_PIN;
-    sensor["value"] = state;
-
-    doc["timestamp"] = getTimestamp();
-    doc["uptime_ms"] = millis();
-
-    String message;
-
-    serializeJson(doc, message);
-
-    webSocket.sendTXT(message);
-
-    Serial.print("TX SENSOR: ");
-    Serial.println(message);
+    return;
+  }
 }
 
 // ============================================================
-// SEND DEVICE STATUS
-// ============================================================
-
-void sendStatus()
-{
-    if (!webSocket.isConnected())
-    {
-        return;
-    }
-
-    StaticJsonDocument<384> doc;
-
-    doc["type"] = "status";
-    doc["device_id"] = DEVICE_ID;
-
-    doc["uptime_ms"] = millis();
-
-    doc["wifi"]["rssi"] = WiFi.RSSI();
-    doc["wifi"]["ip"] = WiFi.localIP().toString();
-
-    doc["sensor"]["ir"] = digitalRead(IR_SENSOR_PIN);
-
-    doc["timestamp"] = getTimestamp();
-
-    String message;
-
-    serializeJson(doc, message);
-
-    webSocket.sendTXT(message);
-
-    Serial.print("TX STATUS: ");
-    Serial.println(message);
-}
-
-// ============================================================
-// WEBSOCKET EVENT HANDLER
+// WEBSOCKET EVENT
 // ============================================================
 
 void webSocketEvent(
-    WStype_t type,
-    uint8_t* payload,
-    size_t length
-)
-{
-    switch (type)
-    {
-        // ----------------------------------------------------
-        // CONNECTED
-        // ----------------------------------------------------
+  WStype_t type,
+  uint8_t* payload,
+  size_t length
+) {
 
-        case WStype_CONNECTED:
+  switch (type) {
 
-            Serial.println();
-            Serial.println("================================");
-            Serial.println("WSS CONNECTED");
-            Serial.println("================================");
+    case WStype_DISCONNECTED:
 
-            sendAuthentication();
+      Serial.println("WSS DISCONNECTED");
 
-            break;
+      websocketConnected = false;
+      authenticated = false;
 
+      break;
 
-        // ----------------------------------------------------
-        // DISCONNECTED
-        // ----------------------------------------------------
+    case WStype_CONNECTED:
 
-        case WStype_DISCONNECTED:
+      Serial.println("WSS CONNECTED");
 
-            Serial.println();
-            Serial.println("WSS DISCONNECTED");
+      websocketConnected = true;
+      authenticated = false;
 
-            break;
+      // ------------------------------------------------------
+      // AUTHENTICATION
+      // ------------------------------------------------------
 
+      {
+        JsonDocument doc;
 
-        // ----------------------------------------------------
-        // TEXT MESSAGE
-        // ----------------------------------------------------
+        doc["type"] = "auth";
+        doc["device_id"] = DEVICE_ID;
+        doc["token"] = DEVICE_TOKEN;
 
-        case WStype_TEXT:
-        {
-            Serial.print("RX: ");
+        String output;
 
-            for (size_t i = 0; i < length; i++)
-            {
-                Serial.print((char)payload[i]);
-            }
+        serializeJson(doc, output);
 
-            Serial.println();
+        Serial.print("TX AUTH: ");
+        Serial.println(output);
 
-            StaticJsonDocument<512> doc;
+        webSocket.sendTXT(output);
+      }
 
-            DeserializationError error =
-                deserializeJson(
-                    doc,
-                    payload,
-                    length
-                );
+      break;
 
-            if (error)
-            {
-                Serial.print("JSON error: ");
-                Serial.println(error.c_str());
+    case WStype_TEXT:
 
-                return;
-            }
+      handleServerMessage(
+        payload,
+        length
+      );
 
-            const char* type =
-                doc["type"];
+      break;
 
-            if (!type)
-            {
-                Serial.println("Message has no type");
-                return;
-            }
+    case WStype_BIN:
 
-            // ------------------------------------------------
-            // AUTHENTICATION RESULT
-            // ------------------------------------------------
+      // Server should not normally send binary data
+      // to the ESP32.
+      Serial.printf(
+        "RX BINARY: %u bytes\n",
+        (unsigned int)length
+      );
 
-            if (strcmp(type, "auth_ok") == 0)
-            {
-                Serial.println(
-                    "SERVER AUTHENTICATION ACCEPTED"
-                );
-            }
+      break;
 
-            else if (strcmp(type, "auth_failed") == 0)
-            {
-                Serial.println(
-                    "SERVER REJECTED AUTHENTICATION"
-                );
+    case WStype_ERROR:
 
-                // The server should close the connection.
-                webSocket.disconnect();
-            }
+      Serial.println("WSS ERROR");
 
-            // ------------------------------------------------
-            // PING
-            // ------------------------------------------------
+      break;
 
-            else if (strcmp(type, "ping") == 0)
-            {
-                StaticJsonDocument<128> response;
-
-                response["type"] = "pong";
-                response["device_id"] = DEVICE_ID;
-
-                String message;
-
-                serializeJson(
-                    response,
-                    message
-                );
-
-                webSocket.sendTXT(message);
-            }
-
-            // ------------------------------------------------
-            // SERVER REQUESTS CURRENT SENSOR STATE
-            // ------------------------------------------------
-
-            else if (
-                strcmp(type, "get_sensor") == 0
-            )
-            {
-                sendSensorEvent(
-                    digitalRead(IR_SENSOR_PIN)
-                );
-            }
-
-            // ------------------------------------------------
-            // UNKNOWN MESSAGE
-            // ------------------------------------------------
-
-            else
-            {
-                Serial.print(
-                    "Unknown message type: "
-                );
-
-                Serial.println(type);
-            }
-
-            break;
-        }
-
-
-        // ----------------------------------------------------
-        // BINARY
-        // ----------------------------------------------------
-
-        case WStype_BIN:
-
-            Serial.println(
-                "Received binary message"
-            );
-
-            break;
-
-
-        default:
-            break;
-    }
+    default:
+      break;
+  }
 }
-
-// ============================================================
-// CONNECT TO WIFI
-// ============================================================
-
-void connectWiFi()
-{
-    Serial.println();
-    Serial.println(
-        "Connecting to WiFi..."
-    );
-
-    WiFi.mode(WIFI_STA);
-
-    WiFi.setSleep(false);
-
-    WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD
-    );
-
-    while (
-        WiFi.status() != WL_CONNECTED
-    )
-    {
-        delay(500);
-
-        Serial.print(".");
-    }
-
-    Serial.println();
-    Serial.println(
-        "WiFi connected"
-    );
-
-    Serial.print(
-        "IP address: "
-    );
-
-    Serial.println(
-        WiFi.localIP()
-    );
-
-    Serial.print(
-        "RSSI: "
-    );
-
-    Serial.println(
-        WiFi.RSSI()
-    );
-}
-
-// ============================================================
-// SYNCHRONIZE CLOCK
-// ============================================================
-//
-// TLS certificates have validity periods, so the ESP32 needs
-// a reasonably accurate clock before certificate validation.
-//
-
-void synchronizeClock()
-{
-    Serial.println();
-    Serial.println(
-        "Synchronizing clock..."
-    );
-
-    configTime(
-        0,
-        0,
-        "pool.ntp.org",
-        "time.nist.gov"
-    );
-
-    time_t now = time(nullptr);
-
-    int attempts = 0;
-
-    while (
-        now < 1700000000 &&
-        attempts < 30
-    )
-    {
-        delay(500);
-
-        Serial.print(".");
-
-        now = time(nullptr);
-
-        attempts++;
-    }
-
-    Serial.println();
-
-    if (now >= 1700000000)
-    {
-        Serial.println(
-            "Clock synchronized"
-        );
-
-        Serial.println(
-            getTimestamp()
-        );
-    }
-    else
-    {
-        Serial.println(
-            "WARNING: Clock synchronization failed"
-        );
-    }
-}
-
-// ============================================================
-// CONNECT TO WSS SERVER
-// ============================================================
 
 void connectWebSocket()
 {
@@ -562,167 +856,129 @@ void connectWebSocket()
         3000,
         2
     );
+
+    Serial.println(
+    "WSS client initialized"
+  );
 }
-
-// ============================================================
-// VIDEO CONFIGURATION
-// ============================================================
-
-// Set to false while the camera is not physically installed.
-#define CAMERA_ENABLED false
-
-// Available sources
-enum VideoSource {
-  VIDEO_PLACEHOLDER,
-  VIDEO_CAMERA
-};
-
-// This is the source currently being used.
-// With CAMERA_ENABLED=false this will remain PLACEHOLDER.
-VideoSource videoSource = VIDEO_PLACEHOLDER;
-
-// Target frame interval
-const uint32_t VIDEO_FRAME_INTERVAL_MS = 500;   // 2 FPS
-
 // ============================================================
 // SETUP
 // ============================================================
 
-void setup()
-{
-    Serial.begin(115200);
+void setup() {
 
-    delay(1000);
+  Serial.begin(115200);
 
-    Serial.println();
-    Serial.println(
-        "========================================"
-    );
+  delay(1000);
 
-    Serial.println(
-        "PARKING LOT IoT SLAVE"
-    );
+  Serial.println();
+  Serial.println("================================");
+  Serial.println(" PARKING ESP32-CAM SLAVE");
+  Serial.println("================================");
 
-    Serial.println(
-        "ESP32-CAM"
-    );
+  // ----------------------------------------------------------
+  // IR SENSOR
+  // ----------------------------------------------------------
 
-    Serial.println(
-        "========================================"
-    );
+  pinMode(
+    IR_SENSOR_PIN,
+    INPUT
+  );
 
-    Serial.print(
-        "Device ID: "
-    );
+  lastIRState =
+    digitalRead(IR_SENSOR_PIN);
 
-    Serial.println(
-        DEVICE_ID
-    );
+  // ----------------------------------------------------------
+  // WIFI
+  // ----------------------------------------------------------
 
-    // --------------------------------------------------------
-    // IR SENSOR
-    // --------------------------------------------------------
+  connectWiFi();
 
-    pinMode(
-        IR_SENSOR_PIN,
-        INPUT
-    );
+  // ----------------------------------------------------------
+  // TIME
+  // ----------------------------------------------------------
 
-    Serial.print(
-        "IR sensor GPIO: "
-    );
+  synchronizeTime();
 
-    Serial.println(
-        IR_SENSOR_PIN
-    );
+  // ----------------------------------------------------------
+  // CAMERA
+  // ----------------------------------------------------------
 
-    // --------------------------------------------------------
-    // WIFI
-    // --------------------------------------------------------
+  cameraInitialized =
+    initializeCamera();
 
-    connectWiFi();
+  if (cameraInitialized) {
 
-    // --------------------------------------------------------
-    // TIME
-    // --------------------------------------------------------
+    videoSource = VIDEO_CAMERA;
 
-    synchronizeClock();
+  } else {
 
-    // --------------------------------------------------------
-    // WSS
-    // --------------------------------------------------------
+    videoSource = VIDEO_PLACEHOLDER;
+  }
 
-    connectWebSocket();
+  Serial.print("Video source: ");
+  Serial.println(videoSourceName());
 
-    Serial.println();
-    Serial.println(
-        "Slave initialized."
-    );
+  // ----------------------------------------------------------
+  // WSS
+  // ----------------------------------------------------------
+
+  connectWebSocket();
+
 }
 
 // ============================================================
 // LOOP
 // ============================================================
 
-void loop()
-{
-    // --------------------------------------------------------
-    // WebSocket processing
-    // --------------------------------------------------------
+uint32_t lastSensorSample = 0;
+uint32_t lastStatus = 0;
 
-    webSocket.loop();
+void loop() {
 
-    // --------------------------------------------------------
-    // Sensor sampling
-    // --------------------------------------------------------
+  webSocket.loop();
 
-    if (
-        millis() - lastSensorSample >=
-        SENSOR_SAMPLE_INTERVAL
-    )
-    {
-        lastSensorSample = millis();
+  // ----------------------------------------------------------
+  // IR SENSOR
+  // ----------------------------------------------------------
 
-        int currentState =
-            digitalRead(
-                IR_SENSOR_PIN
-            );
+  uint32_t now = millis();
 
-        // Send only when state changes
-        if (
-            currentState !=
-            lastSensorState
-        )
-        {
-            lastSensorState =
-                currentState;
+  if (now - lastSensorSample >= 100) {
 
-            Serial.print(
-                "IR state changed: "
-            );
+    lastSensorSample = now;
 
-            Serial.println(
-                currentState
-            );
+    int currentState =
+      digitalRead(IR_SENSOR_PIN);
 
-            sendSensorEvent(
-                currentState
-            );
-        }
+    if (currentState != lastIRState) {
+
+      lastIRState = currentState;
+
+      Serial.print(
+        "IR changed: "
+      );
+
+      Serial.println(currentState);
+
+      sendSensorEvent();
     }
+  }
 
-    // --------------------------------------------------------
-    // Periodic status
-    // --------------------------------------------------------
+  // ----------------------------------------------------------
+  // STATUS
+  // ----------------------------------------------------------
 
-    if (
-        millis() - lastStatusMessage >=
-        STATUS_INTERVAL
-    )
-    {
-        lastStatusMessage =
-            millis();
+  if (now - lastStatus >= 5000) {
 
-        sendStatus();
-    }
+    lastStatus = now;
+
+    sendStatus();
+  }
+
+  // ----------------------------------------------------------
+  // VIDEO
+  // ----------------------------------------------------------
+
+  videoLoop();
 }
