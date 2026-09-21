@@ -7,6 +7,7 @@
 
 #include "esp_camera.h"
 #include "placeholder.h"
+
 // ============================================================
 // CONFIGURATION
 // ============================================================
@@ -19,7 +20,7 @@ const uint16_t SERVER_PORT = 8766;
 const char* SERVER_PATH = "/parking";
 
 #define DEVICE_ID "PARKING-ESP32-001"
-#define DEVICE_TOKEN "EQRTaGx_kFcalO3eCjd_5qaBZjJV2MpMrqxuRhRTCSw"
+#define DEVICE_TOKEN "EQRTaGx_kFcalO3eCjd_5qaBZjJV2MpMrqxuRhRTCSW"
 
 // ============================================================
 // CAMERA CONFIGURATION
@@ -30,7 +31,7 @@ const char* SERVER_PATH = "/parking";
 #define CAMERA_ENABLED true
 
 // Frames per second when streaming.
-const uint32_t VIDEO_FRAME_INTERVAL_MS = 100;
+const uint32_t VIDEO_FRAME_INTERVAL_MS = 500;
 
 // ============================================================
 // IR SENSOR
@@ -107,11 +108,11 @@ jP5O/XAl53f0+fjDHbxe33fAJrQdovI7vvTYYGr12YxFmg90N2eZEiXtEFxLlm9T
 B0asdmFfN1zB2N6BWC1zr7FOOKNnr5oniqeBgBFzfFsnge7QKZa8Ql1uteQ3a0Md
 d2ybLCIR/vvqEwWXME6wS2XP4nX60zGwNY2mC4p55jxsFdXo2I296h4gxGOeKadD
 t4eLXemYU9IqB2bO7nw0IdWarcshrGk4JwvCkoXzGxQ/aiO/3GKZVu9iJ/WObVyS
-I0EVWQzZBYQvlbxxbdKoxWn4TPy0vC69wlbDWI0oQZ42+e8GuUIzQvZZyD00od5u
+I0EVWQzZBYQvlbxxbdKoxWn4TPy0vC69wlbDWI0oQZ42+8eGuUIzQvZZyD00od5u
 Sy2wPpEGVxBMiIRD909fuqys0m2iYFaF0lWB7++IJJW8SoFnYSpJHbJlXkxVg+0u
 gqGtgQ79OUp/fgoSSM+eTT01lnrFvB8K1M93xrmDUORrzBpqv+gYrs05byrAIB2a
 6T1m9ZaXKCgtQwtFoPiIqyvqS5EyVSMECPt4frVa4I7dKWVFHqdCgpZ3uCBIj+Lo
-YfPm2N10NIONxZ8D84CB9vjrL+gkL+1DVvs3jA69yCgLbFxslFJ6dDZDRIXvtmgr
+YfPm2N10NIONxZ8D84CB9vjrL+1C/1DVvs3jA69yCgLbFxslFJ6dDZDRIXvtmgr
 f8l4djoujyCHHiIDXV/kog3kVh2lvQrsjwfncIAgc9jMz4mHo1juSkHCgEJYNagK
 lVfjQukCRNqjjDVGmFO3IM8Dt67JYzyLIaTb714=
 -----END CERTIFICATE-----
@@ -125,19 +126,6 @@ WebSocketsClient webSocket;
 
 bool websocketConnected = false;
 bool authenticated = false;
-
-// ============================================================
-// PLACEHOLDER JPEG
-// ============================================================
-//
-// This is a very small JPEG placeholder.
-// The host receives it as a normal binary JPEG frame.
-//
-// The ESP32 doesn't need to know anything about how the host
-// displays it.
-//
-// ============================================================
-
 
 // ============================================================
 // TIME
@@ -240,7 +228,7 @@ bool initializeCamera() {
 #else
 
   Serial.println();
-  Serial.println("Initializing AI-Thinker camera...");
+  Serial.println("Initializing RHYX M21-45 / RGB565 camera...");
 
   camera_config_t config;
 
@@ -269,28 +257,45 @@ bool initializeCamera() {
 
   config.xclk_freq_hz = 20000000;
 
-  config.pixel_format = PIXFORMAT_JPEG;
+  // ----------------------------------------------------------
+  // RHYX M21-45
+  //
+  // This camera does NOT provide hardware JPEG encoding.
+  // It must be configured for raw RGB565 output.
+  // ----------------------------------------------------------
 
-  // Start conservatively.
+  config.pixel_format = PIXFORMAT_RGB565;
+
+  // QVGA = 320 x 240
+  //
+  // RGB565:
+  // 320 * 240 * 2 = 153600 bytes per frame
+  //
   config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12;
-  config.fb_count = 2;
 
+  // RGB565 does not use JPEG compression quality.
+  config.jpeg_quality = 10;
+
+  // Use PSRAM for the RGB565 frame buffer.
   if (psramFound()) {
 
     Serial.println("PSRAM detected");
 
-    config.frame_size = FRAMESIZE_VGA;
-    config.jpeg_quality = 10;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
     config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
 
   } else {
 
     Serial.println("PSRAM not detected");
 
-    config.frame_size = FRAMESIZE_QVGA;
-    config.jpeg_quality = 12;
+    // QVGA RGB565 requires approximately 150 KB.
+    // This may still work, but only one framebuffer
+    // should be used when PSRAM is unavailable.
+
+    config.fb_location = CAMERA_FB_IN_DRAM;
     config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   }
 
   esp_err_t err = esp_camera_init(&config);
@@ -315,11 +320,15 @@ bool initializeCamera() {
 
     sensor->set_framesize(
       sensor,
-      psramFound() ? FRAMESIZE_VGA : FRAMESIZE_QVGA
+      FRAMESIZE_QVGA
     );
   }
 
-  Serial.println("Camera initialized successfully");
+  Serial.println("RHYX M21-45 camera initialized successfully");
+
+  Serial.println("Pixel format: RGB565");
+  Serial.println("Resolution: 320x240");
+  Serial.println("Bytes per frame: 153600");
 
   return true;
 
@@ -360,6 +369,15 @@ void sendVideoStatus() {
   doc["source"] = videoSourceName();
   doc["camera_enabled"] = CAMERA_ENABLED;
   doc["camera_initialized"] = cameraInitialized;
+
+  if (videoSource == VIDEO_CAMERA) {
+    doc["format"] = "rgb565";
+    doc["width"] = 320;
+    doc["height"] = 240;
+  } else {
+    doc["format"] = "jpeg";
+  }
+
   doc["timestamp"] = getTimestamp();
 
   String output;
@@ -438,14 +456,29 @@ void sendCameraFrame() {
     return;
   }
 
+  // ----------------------------------------------------------
+  // RHYX M21-45 RGB565 FRAME
+  // ----------------------------------------------------------
+  //
+  // The framebuffer is already raw RGB565.
+  //
+  // No JPEG conversion is performed.
+  //
+  // QVGA:
+  //
+  // 320 x 240 x 2 bytes = 153600 bytes
+  //
+  // ----------------------------------------------------------
+
   JsonDocument doc;
 
   doc["type"] = "video_frame";
   doc["device_id"] = DEVICE_ID;
   doc["source"] = "camera";
-  doc["format"] = "jpeg";
+  doc["format"] = "rgb565";
   doc["width"] = fb->width;
   doc["height"] = fb->height;
+  doc["bytes"] = fb->len;
   doc["frame_id"] = videoFrameCounter++;
   doc["timestamp"] = getTimestamp();
 
@@ -455,9 +488,17 @@ void sendCameraFrame() {
 
   webSocket.sendTXT(metadata);
 
+  // Send raw RGB565 data as binary WebSocket frame.
   webSocket.sendBIN(
     fb->buf,
     fb->len
+  );
+
+  Serial.printf(
+    "TX RGB565 FRAME: %ux%u, %u bytes\n",
+    fb->width,
+    fb->height,
+    (unsigned int)fb->len
   );
 
   esp_camera_fb_return(fb);
@@ -563,6 +604,14 @@ void sendStatus() {
   video["source"] = videoSourceName();
   video["camera_enabled"] = CAMERA_ENABLED;
   video["camera_initialized"] = cameraInitialized;
+
+  if (videoSource == VIDEO_CAMERA) {
+    video["format"] = "rgb565";
+    video["width"] = 320;
+    video["height"] = 240;
+  } else {
+    video["format"] = "jpeg";
+  }
 
   doc["timestamp"] = getTimestamp();
 
@@ -861,6 +910,7 @@ void connectWebSocket()
     "WSS client initialized"
   );
 }
+
 // ============================================================
 // SETUP
 // ============================================================
@@ -982,3 +1032,4 @@ void loop() {
 
   videoLoop();
 }
+
