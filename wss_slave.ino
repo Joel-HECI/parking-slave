@@ -11,15 +11,15 @@
 // CONFIGURATION
 // ============================================================
 
-const char* WIFI_SSID     = "TITAPUTIN";
-const char* WIFI_PASSWORD = "Renegade#2025";
+const char* WIFI_SSID     = "David";
+const char* WIFI_PASSWORD = "holaxd123";
 
-const char* SERVER_HOST = "192.168.1.23";
+const char* SERVER_HOST = "10.193.75.46";
 const uint16_t SERVER_PORT = 8766;
 const char* SERVER_PATH = "/parking";
 
 #define DEVICE_ID "PARKING-ESP32-001"
-#define DEVICE_TOKEN "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
+#define DEVICE_TOKEN "EQRTaGx_kFcalO3eCjd_5qaBZjJV2MpMrqxuRhRTCSw"
 
 // ============================================================
 // CAMERA CONFIGURATION
@@ -27,10 +27,10 @@ const char* SERVER_PATH = "/parking";
 
 // IMPORTANT:
 // Keep this false until the camera is physically installed.
-#define CAMERA_ENABLED false
+#define CAMERA_ENABLED true
 
 // Frames per second when streaming.
-const uint32_t VIDEO_FRAME_INTERVAL_MS = 500;
+const uint32_t VIDEO_FRAME_INTERVAL_MS = 100;
 
 // ============================================================
 // IR SENSOR
@@ -72,7 +72,7 @@ enum VideoSource {
   VIDEO_CAMERA
 };
 
-VideoSource videoSource = VIDEO_PLACEHOLDER;
+VideoSource videoSource = VIDEO_CAMERA;
 
 bool cameraInitialized = false;
 
